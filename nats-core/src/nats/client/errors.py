@@ -3,12 +3,31 @@
 from __future__ import annotations
 
 __all__ = [
+    "ConnectionClosedError",
     "MaxPayloadError",
     "NoRespondersError",
     "SecureConnectionRequiredError",
     "SlowConsumerError",
     "StatusError",
 ]
+
+
+class ConnectionClosedError(ConnectionError):
+    """Raised when an in-flight request can no longer be answered.
+
+    The client fails pending request futures with this error as soon as the
+    connection reaches the terminal ``CLOSED`` state — either because
+    :meth:`Client.close` was called, reconnection was disabled, or the
+    reconnect budget was exhausted — so waiters do not hang until their own
+    timeout or receive a bare :class:`asyncio.CancelledError`.
+
+    A transient disconnect followed by a successful reconnect does **not**
+    raise this error: the request futures stay pending and are answered over
+    the new connection.
+    """
+
+    def __init__(self, message: str = "Connection is closed") -> None:
+        super().__init__(message)
 
 
 class MaxPayloadError(ValueError):

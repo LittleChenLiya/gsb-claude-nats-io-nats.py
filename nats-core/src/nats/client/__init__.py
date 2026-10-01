@@ -39,6 +39,7 @@ from urllib.parse import urlparse
 
 from nats.client.connection import Connection, establish_connection
 from nats.client.errors import (
+    ConnectionClosedError,
     MaxPayloadError,
     NoRespondersError,
     SecureConnectionRequiredError,
@@ -636,6 +637,34 @@ class Client(AbstractAsyncContextManager["Client"]):
                     logger.exception("Error during final flush")
             return
 
+    def _resolve_request_future(self, token: int, message: Message) -> None:
+        """Resolve the request waiter for ``token`` with a server response.
+
+        The waiter is removed from ``_request_futures`` before the result is
+        set. A close that races the response goes through
+        :meth:`_fail_request_futures`, and the two paths share the same
+        pop-then-check guard, so a response and a close can complete a waiter
+        only once — whichever wins the dictionary pop resolves it, the loser
+        observes ``None`` / an already-done future.
+        """
+        future = self._request_futures.pop(token, None)
+        if future is not None and not future.done():
+            future.set_result(message)
+
+    def _fail_request_futures(self, error: ConnectionClosedError) -> None:
+        """Fail every in-flight request waiter with ``error``.
+
+        Called when the connection reaches the terminal ``CLOSED`` state so
+        that request waiters are unblocked immediately with an explicit
+        connection-closed error instead of waiting out their timeout. Only
+        unresolved futures are touched; a response racing the close has
+        already removed its waiter in :meth:`_resolve_request_future`.
+        """
+        for token, future in list(self._request_futures.items()):
+            self._request_futures.pop(token, None)
+            if not future.done():
+                future.set_exception(error)
+
     async def _handle_msg(self, subject: str, sid: str, reply: str | None, payload: bytes) -> None:
         """Handle MSG from server."""
         self._stats_in_messages += 1
@@ -647,9 +676,7 @@ class Client(AbstractAsyncContextManager["Client"]):
                 token = int(subject[len(self._request_prefix) :])
             except (ValueError, TypeError):
                 return
-            future = self._request_futures.pop(token, None)
-            if future is not None and not future.done():
-                future.set_result(Message(subject=subject, data=payload, reply=reply))
+            self._resolve_request_future(token, Message(subject=subject, data=payload, reply=reply))
             return
 
         if sid in self._subscriptions:
@@ -717,20 +744,19 @@ class Client(AbstractAsyncContextManager["Client"]):
                 token = int(subject[len(self._request_prefix) :])
             except (ValueError, TypeError):
                 return
-            future = self._request_futures.pop(token, None)
-            if future is not None and not future.done():
-                status = None
-                if status_code is not None:
-                    status = Status(code=status_code, description=status_description)
-                future.set_result(
-                    Message(
-                        subject=subject,
-                        data=payload,
-                        reply=reply,
-                        headers=Headers(headers) if headers else None,  # type: ignore[arg-type]
-                        status=status,
-                    )
-                )
+            status = None
+            if status_code is not None:
+                status = Status(code=status_code, description=status_description)
+            self._resolve_request_future(
+                token,
+                Message(
+                    subject=subject,
+                    data=payload,
+                    reply=reply,
+                    headers=Headers(headers) if headers else None,  # type: ignore[arg-type]
+                    status=status,
+                ),
+            )
             return
 
         if sid in self._subscriptions:
@@ -1079,8 +1105,15 @@ class Client(AbstractAsyncContextManager["Client"]):
                 logger.error("Reconnection failed after maximum attempts")
                 self._reconnecting = False
                 self._status = ClientStatus.CLOSED
+                # Reconnect budget exhausted — the transport is gone for good.
+                # Close out request waiters immediately with an explicit error
+                # instead of letting them run down their own timeouts.
+                self._fail_request_futures(ConnectionClosedError())
             else:
                 self._status = ClientStatus.CLOSED
+                # Reconnection disabled (e.g. client.close()/drain already in
+                # progress): request waiters can never be answered either.
+                self._fail_request_futures(ConnectionClosedError())
 
     async def _force_flush(self) -> None:
         """Flush pending messages to the server."""
@@ -1339,13 +1372,14 @@ class Client(AbstractAsyncContextManager["Client"]):
             The response message
 
         Raises:
-            RuntimeError: If the connection is closed
+            ConnectionClosedError: If the connection is closed before the call,
+                or it closes permanently (without reconnecting) while the
+                response is in flight
             TimeoutError: If no response is received within the timeout
             StatusError: If return_on_error=False and the response contains error status headers
         """
         if self._status == ClientStatus.CLOSED:
-            msg = "Connection is closed"
-            raise RuntimeError(msg)
+            raise ConnectionClosedError()
 
         if not self._skip_subject_validation:
             _validate_subject(subject)
@@ -1494,10 +1528,11 @@ class Client(AbstractAsyncContextManager["Client"]):
             with contextlib.suppress(asyncio.CancelledError, RuntimeError):
                 await self._write_task
 
-        for future in self._request_futures.values():
-            if not future.done():
-                future.cancel()
-        self._request_futures.clear()
+        # Give in-flight request waiters an explicit, actionable error rather
+        # than a bare CancelledError. If the read loop is concurrently closing
+        # the client via _force_disconnect the pop-then-set guard in both
+        # paths guarantees each waiter completes exactly once.
+        self._fail_request_futures(ConnectionClosedError())
 
         subscription_count = len(self._subscriptions)
         if subscription_count > 0:
@@ -2008,6 +2043,7 @@ __all__ = [
     "ServerInfo",
     "ClientStatus",
     "ClientStatistics",
+    "ConnectionClosedError",
     "StatusError",
     "NoRespondersError",
     "MaxPayloadError",
