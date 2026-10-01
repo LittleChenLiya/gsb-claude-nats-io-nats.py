@@ -1082,6 +1082,26 @@ class Client(AbstractAsyncContextManager["Client"]):
             else:
                 self._status = ClientStatus.CLOSED
 
+        # The connection is permanently closed (reconnect exhausted, disabled,
+        # or close() in progress). Unblock any caller parked in request() with
+        # a clear error instead of letting it hang until its timeout.
+        if self._status == ClientStatus.CLOSED:
+            self._fail_pending_requests(ConnectionError("Connection closed"))
+
+    def _fail_pending_requests(self, exc: Exception) -> None:
+        """Fail all pending request futures with ``exc``.
+
+        Called when the connection is permanently closed so callers blocked in
+        :meth:`request` receive a clear error immediately instead of waiting for
+        their timeout. Futures that have already completed (e.g. a response
+        arrived) are left untouched, so the response-vs-close race always has
+        exactly one winner.
+        """
+        for future in self._request_futures.values():
+            if not future.done():
+                future.set_exception(exc)
+        self._request_futures.clear()
+
     async def _force_flush(self) -> None:
         """Flush pending messages to the server."""
         if not self._pending_messages:
@@ -1343,7 +1363,7 @@ class Client(AbstractAsyncContextManager["Client"]):
             TimeoutError: If no response is received within the timeout
             StatusError: If return_on_error=False and the response contains error status headers
         """
-        if self._status == ClientStatus.CLOSED:
+        if self._status in (ClientStatus.CLOSED, ClientStatus.CLOSING):
             msg = "Connection is closed"
             raise RuntimeError(msg)
 
@@ -1494,10 +1514,9 @@ class Client(AbstractAsyncContextManager["Client"]):
             with contextlib.suppress(asyncio.CancelledError, RuntimeError):
                 await self._write_task
 
-        for future in self._request_futures.values():
-            if not future.done():
-                future.cancel()
-        self._request_futures.clear()
+        # Fail any in-flight requests with a clear close error rather than
+        # leaving them to surface as CancelledError or hang until timeout.
+        self._fail_pending_requests(ConnectionError("Connection closed"))
 
         subscription_count = len(self._subscriptions)
         if subscription_count > 0:
