@@ -429,6 +429,14 @@ class _OrderedMessageBatch(MessageBatch):
     def error(self) -> Exception | None:
         return self._inner.error
 
+    @property
+    def received(self) -> int:
+        return self._inner.received
+
+    @property
+    def complete(self) -> bool:
+        return self._inner.complete
+
     def __aiter__(self) -> AsyncIterator[Message]:
         return self
 

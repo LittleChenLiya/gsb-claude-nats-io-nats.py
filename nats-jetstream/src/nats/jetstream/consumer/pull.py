@@ -5,6 +5,7 @@ import contextlib
 import json
 import logging
 import time
+from dataclasses import dataclass, field
 from types import TracebackType
 from typing import (
     TYPE_CHECKING,
@@ -53,9 +54,40 @@ def _message_size(msg: ClientMessage) -> int:
     return size
 
 
+@dataclass(slots=True)
+class PartialFetchResult:
+    """Result of a partial-result batch fetch (:meth:`PullConsumer.fetch_partial`).
+
+    Attributes:
+        messages: Messages received before the batch ended (possibly fewer
+            than requested when the deadline expired first).
+        complete: ``True`` when every requested message was delivered before
+            the deadline; ``False`` when the result is partial.
+        error: Terminal error that ended the batch, if any.
+    """
+
+    messages: list[Message] = field(default_factory=list)
+    complete: bool = False
+    error: Exception | None = None
+
+    @property
+    def received(self) -> int:
+        """Number of messages received."""
+        return len(self.messages)
+
+    def __len__(self) -> int:
+        return len(self.messages)
+
+    def __iter__(self):
+        return iter(self.messages)
+
+
 class PullMessageBatch(MessageBatch):
     _subscription: Subscription
+    _batch_size: int
     _pending_messages: int
+    _received_messages: int
+    _complete: bool
     _jetstream: Any
     _terminated: bool
     _error: Exception | None
@@ -74,7 +106,10 @@ class PullMessageBatch(MessageBatch):
         heartbeat: float | None = None,
     ):
         self._subscription = subscription
+        self._batch_size = batch_size
         self._pending_messages = batch_size
+        self._received_messages = 0
+        self._complete = False
         self._jetstream = jetstream
         self._terminated = False
         self._error = None
@@ -107,14 +142,41 @@ class PullMessageBatch(MessageBatch):
     def error(self) -> Exception | None:
         return self._error
 
+    @property
+    def received(self) -> int:
+        """Number of real messages delivered so far.
+
+        Status frames (heartbeats, timeouts, errors) never count towards
+        this total -- only messages returned to the caller do.
+        """
+        return self._received_messages
+
+    @property
+    def complete(self) -> bool:
+        """Whether the batch delivered every requested message.
+
+        ``False`` when the batch ended early (deadline reached, no more
+        messages, or a terminating status frame) or is still in progress.
+        """
+        return self._complete
+
+    async def close(self) -> None:
+        """Terminate the batch and release the subscription. Idempotent."""
+        if not self._terminated:
+            self._terminated = True
+            await self._subscription.unsubscribe()
+
     def __aiter__(self) -> AsyncIterator[Message]:
         return self
 
     async def __anext__(self) -> Message:
         if self._terminated or self._pending_messages <= 0:
-            if not self._terminated:
-                await self._subscription.unsubscribe()
-                self._terminated = True
+            if self._pending_messages <= 0:
+                # Only real messages decrement the pending count (status
+                # frames never do), so reaching zero means every requested
+                # message was delivered -- the batch is complete.
+                self._complete = True
+            await self.close()
             raise StopAsyncIteration
 
         try:
@@ -208,12 +270,18 @@ class PullMessageBatch(MessageBatch):
                 )
 
                 self._pending_messages -= 1
+                self._received_messages += 1
                 return js_msg
         except (StopAsyncIteration, asyncio.TimeoutError):
-            if not self._terminated:
-                await self._subscription.unsubscribe()
-                self._terminated = True
+            await self.close()
             raise StopAsyncIteration
+        except asyncio.CancelledError:
+            # The task iterating this batch was cancelled -- release the
+            # subscription so it does not leak, then propagate.
+            with contextlib.suppress(Exception):
+                await self._subscription.unsubscribe()
+            self._terminated = True
+            raise
 
 
 class PullMessageStream(MessageStream):
@@ -768,6 +836,75 @@ class PullConsumer(Consumer):
             priority=priority,
             no_wait=False,
         )
+
+    async def fetch_partial(
+        self,
+        *,
+        max_messages: int | None = None,
+        max_bytes: int | None = None,
+        max_wait: float | None = 30.0,
+        heartbeat: float | None = None,
+        min_ack_pending: int | None = None,
+        min_pending: int | None = None,
+        priority_group: str | None = None,
+        priority: int | None = None,
+    ) -> PartialFetchResult:
+        """Fetch a batch of messages with partial-result semantics.
+
+        Unlike :meth:`fetch` (whose iteration simply ends when the deadline
+        expires), this drains the batch internally and returns everything
+        received so far together with a completeness marker: when
+        ``max_wait`` elapses before the batch fills, the caller gets the
+        messages that did arrive and ``complete=False``.
+
+        Args:
+            max_messages: Maximum number of messages to fetch (mutually exclusive with max_bytes)
+            max_bytes: Maximum bytes to fetch (mutually exclusive with max_messages)
+            max_wait: Maximum time to wait for messages in seconds
+            heartbeat: Heartbeat interval in seconds
+            min_ack_pending: Minimum number of unacknowledged messages that can be pending
+            min_pending: Minimum number of messages that should be pending in the stream
+            priority_group: Priority group for message fetching
+            priority: Priority level (0-9, lower is higher priority). Requires priority_group
+                     and consumer with PriorityPolicyPrioritized.
+
+        Returns:
+            PartialFetchResult with the received messages, a ``complete``
+            flag, and any terminal error. Status frames (heartbeats, 408
+            timeouts, etc.) never count as received messages.
+
+        Raises:
+            ValueError: If both max_messages and max_bytes are specified, or neither is specified
+        """
+        if (max_messages is None) == (max_bytes is None):
+            raise ValueError("Must specify exactly one of max_messages or max_bytes")
+
+        # ADR-37: When using max_bytes, set batch to large value (1,000,000) for better throughput
+        batch_size = max_messages if max_messages is not None else 1_000_000
+
+        batch = await self._fetch(
+            batch=batch_size,
+            max_wait=max_wait,
+            heartbeat=heartbeat,
+            max_bytes=max_bytes,
+            min_ack_pending=min_ack_pending,
+            min_pending=min_pending,
+            priority_group=priority_group,
+            priority=priority,
+            no_wait=False,
+        )
+
+        messages: list[Message] = []
+        try:
+            async for msg in batch:
+                messages.append(msg)
+        finally:
+            # Guarantee the subscription is released even if iteration is
+            # interrupted (e.g. the surrounding task is cancelled).
+            if isinstance(batch, PullMessageBatch):
+                await batch.close()
+
+        return PartialFetchResult(messages=messages, complete=batch.complete, error=batch.error)
 
     @overload
     async def fetch_nowait(

@@ -471,6 +471,16 @@ class MessageBatch(AsyncIterable, Protocol):
         """Error that terminated the batch, if any."""
         ...
 
+    @property
+    def received(self) -> int:
+        """Number of real messages delivered so far (status frames excluded)."""
+        ...
+
+    @property
+    def complete(self) -> bool:
+        """Whether the batch delivered every requested message."""
+        ...
+
     def __aiter__(self) -> AsyncIterator[Message]:
         """Return self as an async iterator."""
         ...
