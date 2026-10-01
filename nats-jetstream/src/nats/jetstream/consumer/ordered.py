@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import uuid
 from dataclasses import dataclass
@@ -54,9 +55,16 @@ class OrderedConsumer(Consumer):
     _cursor: _Cursor
     _name_prefix: str
     _serial: int
+    # Monotonically increasing generation of the active server-side consumer.
+    # Every successful (re)creation bumps it; streams fence messages that carry
+    # an older generation so a stale subscription can never deliver late.
+    _generation: int
     _closed: bool
     _last_batch: _OrderedMessageBatch | None
     _delete_tasks: set[asyncio.Task[None]]
+    # Names of server-side consumers whose release has already been scheduled,
+    # so each old subscription/consumer is released at most once.
+    _released_consumers: set[str]
 
     def __init__(
         self,
@@ -69,9 +77,11 @@ class OrderedConsumer(Consumer):
         self._cursor = _Cursor()
         self._name_prefix = cfg.name_prefix or uuid.uuid4().hex
         self._serial = 0
+        self._generation = 0
         self._closed = False
         self._last_batch = None
         self._delete_tasks = set()
+        self._released_consumers = set()
 
     @classmethod
     async def create(cls, stream: Stream, cfg: OrderedConsumerConfig) -> OrderedConsumer:
@@ -82,6 +92,7 @@ class OrderedConsumer(Consumer):
         consumer_config = oc._get_consumer_config()
         consumer = await stream.create_or_update_consumer(consumer_config)
         oc._current_consumer = consumer  # type: ignore[assignment]
+        oc._generation = oc._serial
 
         return oc
 
@@ -132,7 +143,7 @@ class OrderedConsumer(Consumer):
 
         # Delete current consumer
         if self._current_consumer is not None:
-            await self._delete_consumer(self._current_consumer.name)
+            await self._delete_consumer_once(self._current_consumer.name)
             self._current_consumer = None
 
         # Cancel and await pending delete tasks
@@ -360,16 +371,19 @@ class OrderedConsumer(Consumer):
         )
 
     async def _reset(self) -> None:
-        """Reset the ordered consumer by deleting old and creating new."""
+        """Reset the ordered consumer by deleting old and creating new.
+
+        A successful reset bumps the generation fence: inner streams created
+        before the reset belong to the old generation, and any messages they
+        still deliver are discarded.
+        """
         if self._closed:
             raise OrderedConsumerClosedError("Ordered consumer is closed")
 
-        # Delete old consumer (fire-and-forget)
+        # Delete old consumer (fire-and-forget, at most once per name)
         if self._current_consumer is not None:
             old_name = self._current_consumer.name
-            task = asyncio.create_task(self._delete_consumer(old_name))
-            self._delete_tasks.add(task)
-            task.add_done_callback(self._delete_tasks.discard)
+            self._schedule_consumer_delete(old_name)
 
         # Reset delivery sequence tracking
         self._cursor.deliver_seq = 0
@@ -390,6 +404,8 @@ class OrderedConsumer(Consumer):
             try:
                 consumer = await self._stream.create_or_update_consumer(config)
                 self._current_consumer = consumer  # type: ignore[assignment]
+                # Raise the generation fence only after the new consumer exists.
+                self._generation = self._serial
                 return
             except Exception as e:
                 attempts += 1
@@ -408,6 +424,27 @@ class OrderedConsumer(Consumer):
 
                 await asyncio.sleep(interval)
                 interval = min(interval * factor, max_interval)
+
+    def _schedule_consumer_delete(self, name: str) -> None:
+        """Fire-and-forget release of an old server-side consumer, once per name."""
+        if name in self._released_consumers:
+            return
+        self._released_consumers.add(name)
+        task = asyncio.create_task(self._delete_consumer(name))
+        self._delete_tasks.add(task)
+        task.add_done_callback(self._delete_tasks.discard)
+
+    async def _delete_consumer_once(self, name: str) -> None:
+        """Delete a server-side consumer synchronously, at most once per name."""
+        if name in self._released_consumers:
+            # A fire-and-forget delete was scheduled earlier; await it so the
+            # release is complete by the time close() returns.
+            pending = [t for t in self._delete_tasks if not t.done()]
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            return
+        self._released_consumers.add(name)
+        await self._delete_consumer(name)
 
     async def _delete_consumer(self, name: str) -> None:
         """Delete a server-side consumer, ignoring errors."""
@@ -457,9 +494,19 @@ class _OrderedMessageStream(MessageStream):
         self._max_bytes = max_bytes
         self._inner: PullMessageStream | None = None
         self._closed = False
+        # Generation the current inner stream belongs to. Messages delivered
+        # by an inner stream from an older generation are stale late arrivals
+        # and must be dropped.
+        self._generation = 0
+        # Set of inner streams whose release has already run, so an old
+        # subscription is torn down at most once even if several resets race.
+        self._released_inners: set[PullMessageStream] = set()
 
     async def _create_inner_stream(self) -> PullMessageStream:
-        """Create a new inner PullMessageStream from the current consumer."""
+        """Create a new inner PullMessageStream from the current consumer.
+
+        The returned stream is fenced to the consumer's current generation.
+        """
         if self._consumer._current_consumer is None:
             raise OrderedConsumerClosedError("No active consumer")
         max_wait = self._max_wait if self._max_wait is not None else _DEFAULT_MAX_WAIT
@@ -473,7 +520,52 @@ class _OrderedMessageStream(MessageStream):
             max_messages=self._max_messages,
             max_bytes=self._max_bytes,
         )
+        self._generation = self._consumer._generation
         return stream  # type: ignore[return-value]
+
+    async def _release_inner(self, inner: PullMessageStream) -> None:
+        """Release (stop) an old inner subscription exactly once."""
+        if inner in self._released_inners:
+            return
+        self._released_inners.add(inner)
+        with contextlib.suppress(Exception):
+            await inner.stop()
+
+    async def _rebuild(self, inner: PullMessageStream | None) -> PullMessageStream | None:
+        """Release the given inner stream and rebuild the consumer generation.
+
+        Returns the new inner stream, or None if the stream/consumer is closed
+        or the reset failed terminally.
+        """
+        if self._closed or self._consumer._closed:
+            return None
+
+        if inner is not None:
+            await self._release_inner(inner)
+
+        try:
+            await self._consumer._reset()
+            return await self._create_inner_stream()
+        except (OrderedConsumerClosedError, OrderedConsumerResetError):
+            self._closed = True
+            return None
+
+    async def _rebind(self, inner: PullMessageStream | None) -> bool:
+        """Release a stale inner stream and bind one to the *current* consumer.
+
+        Used when the generation already advanced without this stream's own
+        rebuild path (e.g. an external reset): no second reset is needed.
+        Returns False if the stream is terminally closed.
+        """
+        if inner is not None:
+            await self._release_inner(inner)
+
+        if self._closed or self._consumer._closed or self._consumer._current_consumer is None:
+            self._closed = True
+            return False
+
+        self._inner = await self._create_inner_stream()
+        return True
 
     def __aiter__(self) -> AsyncIterator[Message]:
         return self
@@ -487,51 +579,95 @@ class _OrderedMessageStream(MessageStream):
             self._inner = await self._create_inner_stream()
 
         while True:
+            inner = self._inner
+            generation = self._generation
+            expected_consumer = self._consumer._current_consumer
+
             try:
-                msg = await self._inner.__anext__()
+                msg = await inner.__anext__()
             except StopAsyncIteration:
-                # Inner stream ended - this could be heartbeat miss or other error
-                # Try to reset and recreate
-                if self._closed or self._consumer._closed:
+                # Inner stream ended - this could be heartbeat miss or other error.
+                # Rebuild the consumer generation and retry.
+                new_inner = await self._rebuild(inner)
+                if new_inner is None:
                     raise StopAsyncIteration
+                self._inner = new_inner
+                continue
 
-                try:
-                    await self._consumer._reset()
-                    self._inner = await self._create_inner_stream()
-                    continue
-                except (OrderedConsumerClosedError, OrderedConsumerResetError):
-                    self._closed = True
+            # --- Generation fence -------------------------------------------------
+            # A rebuild (heartbeat gap, consumer deletion, sequence mismatch) may
+            # have created a newer consumer while this old subscription was still
+            # draining. Anything delivered by the old inner stream is a stale,
+            # late arrival: release the old subscription once and drop it.
+            if generation != self._consumer._generation:
+                logger.debug(
+                    "Ordered consumer dropping stale message: inner generation %d, current %d",
+                    generation,
+                    self._consumer._generation,
+                )
+                if not await self._rebind(inner):
                     raise StopAsyncIteration
+                continue
 
-            # Validate sequence - consumer_seq must be consecutive
+            # Belt-and-braces: the message must name the active consumer. With a
+            # real server a late message from the deleted subscription carries
+            # the previous consumer name even if generations were observed equal.
+            if (
+                expected_consumer is not None
+                and msg.metadata.consumer
+                and msg.metadata.consumer != expected_consumer.name
+            ):
+                logger.debug(
+                    "Ordered consumer dropping stale message from consumer %r (active %r)",
+                    msg.metadata.consumer,
+                    expected_consumer.name,
+                )
+                if not await self._rebind(inner):
+                    raise StopAsyncIteration
+                continue
+
+            # --- Sequence validation ---------------------------------------------
             dseq = msg.metadata.sequence.consumer
-            expected = self._consumer._cursor.deliver_seq + 1
+            sseq = msg.metadata.sequence.stream
 
-            if dseq != expected:
+            # New generation boundary (we consumed at least one message before):
+            # the recreated consumer must resume exactly at the next stream
+            # sequence. Starting past it means messages were silently skipped.
+            if generation > 1 and self._consumer._cursor.deliver_seq == 0 and self._consumer._cursor.stream_seq > 0:
+                expected_stream_seq = self._consumer._cursor.stream_seq + 1
+                if sseq != expected_stream_seq:
+                    logger.error(
+                        "Ordered consumer recreated at wrong stream sequence: expected %d, got %d. Resetting.",
+                        expected_stream_seq,
+                        sseq,
+                    )
+                    new_inner = await self._rebuild(inner)
+                    if new_inner is None:
+                        raise StopAsyncIteration
+                    self._inner = new_inner
+                    continue
+
+            # Within a generation consumer_seq must be consecutive.
+            expected_dseq = self._consumer._cursor.deliver_seq + 1
+            if dseq != expected_dseq:
                 logger.debug(
                     "Ordered consumer sequence mismatch: expected %d, got %d. Resetting.",
-                    expected,
+                    expected_dseq,
                     dseq,
                 )
-                # Stop old inner stream
-                if self._inner is not None:
-                    await self._inner.stop()
-
-                try:
-                    await self._consumer._reset()
-                    self._inner = await self._create_inner_stream()
-                    continue
-                except (OrderedConsumerClosedError, OrderedConsumerResetError):
-                    self._closed = True
+                new_inner = await self._rebuild(inner)
+                if new_inner is None:
                     raise StopAsyncIteration
+                self._inner = new_inner
+                continue
 
             # Update cursor
             self._consumer._cursor.deliver_seq = dseq
-            self._consumer._cursor.stream_seq = msg.metadata.sequence.stream
+            self._consumer._cursor.stream_seq = sseq
             return msg
 
     async def stop(self) -> None:
         """Stop the ordered message stream."""
         self._closed = True
         if self._inner is not None:
-            await self._inner.stop()
+            await self._release_inner(self._inner)

@@ -1200,6 +1200,96 @@ async def test_ordered_consumer_messages_resume_after_delete_consumer(jetstream:
     assert consumer._cursor.stream_seq > last_stream_seq
 
 
+async def test_ordered_consumer_messages_generation_fence_after_rebuild(jetstream: JetStream):
+    """Rebuild bumps the generation fence and only new-consumer messages arrive.
+
+    Simulates a disconnect/loss by deleting the underlying consumer mid-stream:
+    - the old subscription is released exactly once;
+    - the consumer generation (serial) increments;
+    - every post-rebuild message names the new consumer and resumes at exactly
+      stream_seq + 1, so neither a stale late message from the old subscription
+      nor a skipped sequence can reach the caller.
+    """
+    stream = await jetstream.create_stream(name="test_oc_gen_fence", subjects=["OC.GF"])
+
+    for i in range(5):
+        await jetstream.publish("OC.GF", f"msg {i}".encode())
+
+    consumer = await stream.ordered_consumer(
+        filter_subjects=["OC.GF"],
+        name_prefix="genfence",
+    )
+    messages = await consumer.messages(max_wait=5.0, heartbeat=0.5)
+
+    # (data, stream_seq, consumer_seq, consumer_name)
+    received: list[tuple[str, int, int, str]] = []
+
+    async for msg in messages:
+        received.append(
+            (
+                msg.data.decode(),
+                msg.metadata.sequence.stream,
+                msg.metadata.sequence.consumer,
+                msg.metadata.consumer,
+            )
+        )
+        if len(received) == 5:
+            break
+
+    assert [r[0] for r in received] == [f"msg {i}" for i in range(5)]
+
+    first_gen = consumer._generation
+    old_inner = messages._inner
+    assert consumer.name == "genfence_1"
+    last_stream_seq = consumer._cursor.stream_seq
+    assert last_stream_seq == 5
+
+    # Lose the underlying consumer (disconnect / server-side deletion).
+    await stream.delete_consumer(consumer.name)
+    for i in range(5):
+        await jetstream.publish("OC.GF", f"more {i}".encode())
+
+    async def drain_new_generation() -> None:
+        async for msg in messages:
+            received.append(
+                (
+                    msg.data.decode(),
+                    msg.metadata.sequence.stream,
+                    msg.metadata.sequence.consumer,
+                    msg.metadata.consumer,
+                )
+            )
+            if len(received) == 10:
+                break
+
+    await asyncio.wait_for(drain_new_generation(), timeout=30)
+
+    # The generation fence advanced.
+    assert consumer._generation == first_gen + 1
+    assert consumer.name == "genfence_2"
+
+    # The new messages resume at exactly the next stream sequence and each is
+    # delivered by the *new* consumer: no stale old-subscription late message
+    # and no skipped sequence reached the caller.
+    new_entries = received[5:]
+    assert [e[0] for e in new_entries] == [f"more {i}" for i in range(5)]
+    assert [e[1] for e in new_entries] == [6, 7, 8, 9, 10]
+    for offset, entry in enumerate(new_entries, start=1):
+        assert entry[1] == last_stream_seq + offset
+        assert entry[2] == offset  # consumer_seq restarts at 1 and stays consecutive
+        assert entry[3] == "genfence_2"
+
+    # The old inner subscription was released exactly once and is no longer bound.
+    assert old_inner in messages._released_inners
+    assert messages._inner is not old_inner
+
+    old_release_members = [i for i in messages._released_inners if i is old_inner]
+    await messages.stop()
+    await messages.stop()  # idempotent
+    # stop() never releases the old inner a second time.
+    assert [i for i in messages._released_inners if i is old_inner] == old_release_members
+
+
 async def test_ordered_consumer_fetch_no_args_raises(jetstream: JetStream):
     """fetch() raises ValueError when neither max_messages nor max_bytes provided."""
     stream = await jetstream.create_stream(name="test_oc_f_noargs", subjects=["OC.FNA.*"])
