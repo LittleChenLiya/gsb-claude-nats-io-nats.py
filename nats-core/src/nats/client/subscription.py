@@ -120,16 +120,38 @@ class Subscription(AsyncIterable[Message], AbstractAsyncContextManager["Subscrip
             async for message in subscription:
                 process(message)
 
+        If the consuming task is cancelled while waiting for a message (or
+        while processing one), the subscription is automatically torn down:
+        an UNSUB is sent to the server, the subscription is removed from the
+        client's registry and the pending queue is shut down so that a late
+        message can never wake the cancelled consumer. The teardown is
+        idempotent and does not affect the manual :meth:`unsubscribe` path.
+
         Returns:
             An async iterator that yields messages
         """
 
         async def iterator():
-            while True:
-                try:
-                    yield await self.next()
-                except RuntimeError:
-                    break
+            try:
+                while True:
+                    try:
+                        yield await self.next()
+                    except RuntimeError:
+                        break
+            except asyncio.CancelledError:
+                # The consuming task was cancelled while waiting for a message.
+                # Tear down the subscription so the server stops delivering and
+                # the client drops its reference; a late message must never wake
+                # the cancelled consumer.
+                await self._handle_consumer_cancelled()
+                raise
+            except GeneratorExit:
+                # The consumer abandoned the iterator — broke out of the loop,
+                # or the task was cancelled while processing a message and the
+                # generator was finalized. Tear down the subscription so the
+                # client releases its reference.
+                await self._handle_consumer_cancelled()
+                raise
 
         return iterator()
 
@@ -283,6 +305,23 @@ class Subscription(AsyncIterable[Message], AbstractAsyncContextManager["Subscrip
         if immediate:
             self._pending_messages = 0
             self._pending_bytes = 0
+        self._closed = True
+
+    async def _handle_consumer_cancelled(self) -> None:
+        """Tear down the subscription when the consuming task is cancelled.
+
+        Sends UNSUB to the server, removes the subscription from the client's
+        registry and shuts down the pending queue so that late messages cannot
+        wake the cancelled consumer. Idempotent — safe to call multiple times
+        (e.g. when several consumers iterate the same subscription).
+        """
+        if self._closed:
+            return
+
+        await self._client._unsubscribe(self._sid)
+        self._pending_queue.shutdown(immediate=True)
+        self._pending_messages = 0
+        self._pending_bytes = 0
         self._closed = True
 
     async def unsubscribe(self) -> None:
