@@ -24,6 +24,68 @@ T = TypeVar("T")
 logger = logging.getLogger(__name__)
 
 
+class _MessageIterator(AsyncIterator[Message]):
+    """Async iterator over a subscription's messages with cancellation reclamation.
+
+    Each call to :attr:`Subscription.messages` (or each ``async for`` on a
+    subscription) creates a fresh iterator backed by the subscription's pending
+    queue.
+
+    When the consuming task is cancelled while the iterator is parked waiting
+    for the next message, the iterator:
+
+    * detaches itself from the internal wait immediately (the cancelled
+      ``Queue.get`` cannot be woken by a subsequently arriving message), and
+    * releases its reference to the subscription, so the subscription is not
+      kept alive by a dead consumer.
+
+    Cancellation never unsubscribes — other consumers and the subscription
+    itself keep working, and messages that arrive after cancellation stay in
+    the queue, consumable via :meth:`Subscription.next` or a new iterator.
+    """
+
+    __slots__ = ("_subscription", "_closed")
+
+    def __init__(self, subscription: Subscription) -> None:
+        self._subscription: Subscription | None = subscription
+        self._closed = False
+
+    def __aiter__(self) -> Self:
+        return self
+
+    async def __anext__(self) -> Message:
+        subscription = self._subscription
+        if self._closed or subscription is None:
+            raise StopAsyncIteration
+
+        try:
+            return await subscription.next()
+        except asyncio.CancelledError:
+            # The consumer is being torn down. Detach deterministically instead
+            # of relying on garbage collection of a suspended generator: a
+            # message arriving later must never resume this iterator, and the
+            # subscription reference must be released right away.
+            self._release()
+            raise
+        except RuntimeError:
+            # The subscription was closed (unsubscribe/drain) and its queue has
+            # been exhausted. End iteration normally.
+            self._release()
+            raise StopAsyncIteration from None
+
+    async def aclose(self) -> None:
+        """Close the iterator, releasing the subscription reference.
+
+        Idempotent — safe to call repeatedly, including after the consuming
+        task was cancelled.
+        """
+        self._release()
+
+    def _release(self) -> None:
+        self._closed = True
+        self._subscription = None
+
+
 class Subscription(AsyncIterable[Message], AbstractAsyncContextManager["Subscription"]):
     """A subscription to a NATS subject.
 
@@ -96,7 +158,7 @@ class Subscription(AsyncIterable[Message], AbstractAsyncContextManager["Subscrip
         """Get the queue group name."""
         return self._queue
 
-    def __aiter__(self) -> AsyncIterator[Message]:
+    def __aiter__(self) -> _MessageIterator:
         """Return an async iterator for messages.
 
         This allows using the subscription as an async iterable:
@@ -109,7 +171,7 @@ class Subscription(AsyncIterable[Message], AbstractAsyncContextManager["Subscrip
         return self.messages
 
     @property
-    def messages(self) -> AsyncIterator[Message]:
+    def messages(self) -> _MessageIterator:
         """Get an async iterator for messages.
 
         This property provides API compatibility with nats-py, allowing:
@@ -120,18 +182,16 @@ class Subscription(AsyncIterable[Message], AbstractAsyncContextManager["Subscrip
             async for message in subscription:
                 process(message)
 
+        Each access returns a fresh iterator. If the task consuming the
+        iterator is cancelled while waiting for a message, the iterator
+        immediately detaches from the internal wait, releases its reference to
+        this subscription, and cannot be woken by later messages. Cancellation
+        never unsubscribes — other iterators and :meth:`next` keep working.
+
         Returns:
             An async iterator that yields messages
         """
-
-        async def iterator():
-            while True:
-                try:
-                    yield await self.next()
-                except RuntimeError:
-                    break
-
-        return iterator()
+        return _MessageIterator(self)
 
     @property
     def closed(self) -> bool:
