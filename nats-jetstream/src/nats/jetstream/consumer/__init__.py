@@ -471,6 +471,16 @@ class MessageBatch(AsyncIterable, Protocol):
         """Error that terminated the batch, if any."""
         ...
 
+    @property
+    def complete(self) -> bool:
+        """Whether the batch was delivered in full.
+
+        Only meaningful for batches fetched with partial results enabled:
+        ``False`` means the deadline expired before all requested messages
+        arrived, while the received messages are still returned.
+        """
+        ...
+
     def __aiter__(self) -> AsyncIterator[Message]:
         """Return self as an async iterator."""
         ...

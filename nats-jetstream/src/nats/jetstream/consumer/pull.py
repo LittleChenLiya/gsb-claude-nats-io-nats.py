@@ -64,6 +64,8 @@ class PullMessageBatch(MessageBatch):
     _heartbeat_deadline: float | None
     _heartbeat_paused: bool
     _heartbeat_remaining: float | None
+    _partial: bool
+    _complete: bool
 
     def __init__(
         self,
@@ -72,6 +74,7 @@ class PullMessageBatch(MessageBatch):
         jetstream,
         max_wait: float | None,
         heartbeat: float | None = None,
+        partial: bool = False,
     ):
         self._subscription = subscription
         self._pending_messages = batch_size
@@ -83,6 +86,8 @@ class PullMessageBatch(MessageBatch):
         self._heartbeat_deadline = time.time() + (heartbeat * 2) if heartbeat is not None else None
         self._heartbeat_paused = False
         self._heartbeat_remaining = None
+        self._partial = partial
+        self._complete = True
 
         # Register disconnect/reconnect callbacks for heartbeat timer (ADR-37)
         if heartbeat is not None:
@@ -106,6 +111,30 @@ class PullMessageBatch(MessageBatch):
     @property
     def error(self) -> Exception | None:
         return self._error
+
+    @property
+    def complete(self) -> bool:
+        """Whether the batch was delivered in full.
+
+        This is only meaningful when the batch was fetched with ``partial=True``.
+        In that mode, when the deadline (or a server-side 408 timeout) expires
+        before all requested messages have arrived, this is ``False`` and the
+        received messages are still returned; otherwise it is ``True``.
+
+        In the default (non-partial) mode this always reports ``True`` — the
+        legacy batch semantics do not surface partial completion.
+        """
+        return self._complete
+
+    def _mark_partial_timeout(self) -> None:
+        """Record that the batch ended early because the deadline expired.
+
+        Only marks the batch incomplete when partial results were requested;
+        status frames (heartbeats, 404/408) never count toward the message
+        count and therefore do not affect this on their own.
+        """
+        if self._partial:
+            self._complete = False
 
     def __aiter__(self) -> AsyncIterator[Message]:
         return self
@@ -134,12 +163,16 @@ class PullMessageBatch(MessageBatch):
                 if self._deadline is not None:
                     timeout = max(0, self._deadline - time.time())
                     if timeout <= 0:
+                        self._mark_partial_timeout()
                         raise StopAsyncIteration
 
                 try:
                     raw_msg: ClientMessage = await self._subscription.next(timeout=timeout)
                 except (TimeoutError, asyncio.TimeoutError):
-                    # If no more messages after timeout, we're done
+                    # If no more messages after timeout, we're done. In partial
+                    # mode the received messages are kept and the batch is
+                    # flagged incomplete instead of raising.
+                    self._mark_partial_timeout()
                     raise StopAsyncIteration
 
                 # Reset heartbeat timer on any message (ADR-37)
@@ -154,6 +187,7 @@ class PullMessageBatch(MessageBatch):
                         case "404":  # No messages
                             raise StopAsyncIteration
                         case "408":  # Timeout
+                            self._mark_partial_timeout()
                             raise StopAsyncIteration
                         case "400":  # Bad Request - terminal error
                             description = raw_msg.status.description or "Bad Request"
@@ -209,11 +243,20 @@ class PullMessageBatch(MessageBatch):
 
                 self._pending_messages -= 1
                 return js_msg
-        except (StopAsyncIteration, asyncio.TimeoutError):
+        except StopAsyncIteration:
             if not self._terminated:
                 await self._subscription.unsubscribe()
                 self._terminated = True
-            raise StopAsyncIteration
+            raise
+        except asyncio.CancelledError:
+            # If the fetch is cancelled (e.g. asyncio.wait_for or task
+            # cancellation), make sure the inbox subscription is torn down so
+            # the client does not leak it. Re-raise to honour the cancellation.
+            if not self._terminated:
+                with contextlib.suppress(Exception):
+                    await self._subscription.unsubscribe()
+                self._terminated = True
+            raise
 
 
 class PullMessageStream(MessageStream):
@@ -705,6 +748,7 @@ class PullConsumer(Consumer):
         min_pending: int | None = None,
         priority_group: str | None = None,
         priority: int | None = None,
+        partial: bool = False,
     ) -> MessageBatch: ...
 
     @overload
@@ -718,6 +762,7 @@ class PullConsumer(Consumer):
         min_pending: int | None = None,
         priority_group: str | None = None,
         priority: int | None = None,
+        partial: bool = False,
     ) -> MessageBatch: ...
 
     async def fetch(
@@ -731,6 +776,7 @@ class PullConsumer(Consumer):
         min_pending: int | None = None,
         priority_group: str | None = None,
         priority: int | None = None,
+        partial: bool = False,
     ) -> MessageBatch:
         """Fetch a batch of messages from the consumer.
 
@@ -744,6 +790,14 @@ class PullConsumer(Consumer):
             priority_group: Priority group for message fetching
             priority: Priority level (0-9, lower is higher priority). Requires priority_group
                      and consumer with PriorityPolicyPrioritized.
+            partial: When ``True``, the batch returns the messages received so
+                     far if the deadline (or a server-side 408 timeout) expires
+                     before the full batch is available, instead of ending
+                     silently. Check :attr:`MessageBatch.complete` to see
+                     whether the batch was delivered in full. When ``False``
+                     (the default) the legacy behavior is preserved: the batch
+                     ends without raising and no partial-result information is
+                     reported.
 
         Returns:
             MessageBatch containing the fetched messages
@@ -767,6 +821,7 @@ class PullConsumer(Consumer):
             priority_group=priority_group,
             priority=priority,
             no_wait=False,
+            partial=partial,
         )
 
     @overload
@@ -848,6 +903,7 @@ class PullConsumer(Consumer):
         priority_group: str | None = None,
         priority: int | None = None,
         no_wait: bool,
+        partial: bool = False,
     ) -> MessageBatch:
         jetstream = self._stream._jetstream
         inbox = new_inbox()
@@ -883,5 +939,10 @@ class PullConsumer(Consumer):
         await jetstream.client.publish(subject, payload=payload, reply=inbox)
 
         return PullMessageBatch(
-            subscription=subscription, batch_size=batch, jetstream=jetstream, max_wait=max_wait, heartbeat=heartbeat
+            subscription=subscription,
+            batch_size=batch,
+            jetstream=jetstream,
+            max_wait=max_wait,
+            heartbeat=heartbeat,
+            partial=partial,
         )
