@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import uuid
 from dataclasses import dataclass
@@ -89,6 +90,20 @@ class OrderedConsumer(Consumer):
     def name(self) -> str:
         if self._current_consumer is None:
             return f"{self._name_prefix}_0"
+        return self._current_consumer.name
+
+    @property
+    def current_generation_name(self) -> str:
+        """Name of the current server-side consumer generation.
+
+        The generation name (``<prefix>_<serial>``) is the identity of the
+        underlying consumer the ordered consumer is currently pulling from.
+        Messages that carry a different consumer name in their reply subject
+        were delivered by an old generation and must be discarded by the
+        generation fence.
+        """
+        if self._current_consumer is None:
+            return ""
         return self._current_consumer.name
 
     @property
@@ -429,14 +444,36 @@ class _OrderedMessageBatch(MessageBatch):
     def error(self) -> Exception | None:
         return self._inner.error
 
+    def _is_current_generation(self, msg: Message) -> bool:
+        """Generation fence: True if the message was delivered by the current consumer.
+
+        A message that arrived late from a previous consumer generation carries
+        the old consumer's name in its reply subject. Such a message must be
+        discarded rather than delivered as if it were new.
+        """
+        current = self._consumer.current_generation_name
+        producer = msg.metadata.consumer
+        if not current or not producer:
+            # Cannot determine generation; fall through to sequence validation.
+            return True
+        return producer == current
+
     def __aiter__(self) -> AsyncIterator[Message]:
         return self
 
     async def __anext__(self) -> Message:
-        msg = await self._inner.__anext__()
-        # Track the last consumed stream sequence
-        self.last_stream_seq = msg.metadata.sequence.stream
-        return msg
+        while True:
+            msg = await self._inner.__anext__()
+            if not self._is_current_generation(msg):
+                logger.debug(
+                    "Discarding late batch message from old generation: consumer=%r, current=%r",
+                    msg.metadata.consumer,
+                    self._consumer.current_generation_name,
+                )
+                continue
+            # Track the last consumed stream sequence
+            self.last_stream_seq = msg.metadata.sequence.stream
+            return msg
 
 
 class _OrderedMessageStream(MessageStream):
@@ -457,6 +494,10 @@ class _OrderedMessageStream(MessageStream):
         self._max_bytes = max_bytes
         self._inner: PullMessageStream | None = None
         self._closed = False
+        # Idempotency guard for releasing the current inner subscription. A reset
+        # must tear the old subscription down exactly once; a late release is a
+        # no-op so the subscription is never unsubscribed twice.
+        self._released = False
 
     async def _create_inner_stream(self) -> PullMessageStream:
         """Create a new inner PullMessageStream from the current consumer."""
@@ -474,6 +515,51 @@ class _OrderedMessageStream(MessageStream):
             max_bytes=self._max_bytes,
         )
         return stream  # type: ignore[return-value]
+
+    def _is_current_generation(self, msg: Message) -> bool:
+        """Generation fence: True if the message was delivered by the current consumer.
+
+        After a rebuild, messages that were in flight on the old subscription can
+        still arrive. They carry the old consumer's name in their reply subject.
+        Delivering them would reorder the stream and corrupt the sequence cursor,
+        so they are discarded. When the generation cannot be determined (no
+        consumer name on either side) the message is kept and the consumer
+        sequence check below decides.
+        """
+        current = self._consumer.current_generation_name
+        producer = msg.metadata.consumer
+        if not current or not producer:
+            return True
+        return producer == current
+
+    async def _release_inner(self) -> None:
+        """Release the current inner stream exactly once.
+
+        Unsubscribes the pull subscription so no further messages from the old
+        generation can arrive. Subsequent calls are no-ops, which keeps the
+        release idempotent across the various reset/stop paths.
+        """
+        if self._released:
+            return
+        self._released = True
+        if self._inner is not None:
+            with contextlib.suppress(Exception):
+                await self._inner.stop()
+
+    async def _reset_inner(self) -> None:
+        """Release the old inner stream and rebuild around a fresh consumer generation.
+
+        The old subscription is released before the new consumer is created so
+        that no late pull request can still be answered by the old generation.
+        The new generation resumes at exactly ``cursor.stream_seq + 1`` — the
+        server is configured with that start sequence — so no sequence is
+        skipped.
+        """
+        await self._release_inner()
+        # The new generation has not been released yet.
+        self._released = False
+        await self._consumer._reset()
+        self._inner = await self._create_inner_stream()
 
     def __aiter__(self) -> AsyncIterator[Message]:
         return self
@@ -496,12 +582,21 @@ class _OrderedMessageStream(MessageStream):
                     raise StopAsyncIteration
 
                 try:
-                    await self._consumer._reset()
-                    self._inner = await self._create_inner_stream()
+                    await self._reset_inner()
                     continue
                 except (OrderedConsumerClosedError, OrderedConsumerResetError):
                     self._closed = True
                     raise StopAsyncIteration
+
+            # Generation fence: discard late messages from old consumer generations.
+            if not self._is_current_generation(msg):
+                logger.debug(
+                    "Discarding late message from old generation: consumer=%r, current=%r, stream_seq=%d",
+                    msg.metadata.consumer,
+                    self._consumer.current_generation_name,
+                    msg.metadata.sequence.stream,
+                )
+                continue
 
             # Validate sequence - consumer_seq must be consecutive
             dseq = msg.metadata.sequence.consumer
@@ -513,13 +608,8 @@ class _OrderedMessageStream(MessageStream):
                     expected,
                     dseq,
                 )
-                # Stop old inner stream
-                if self._inner is not None:
-                    await self._inner.stop()
-
                 try:
-                    await self._consumer._reset()
-                    self._inner = await self._create_inner_stream()
+                    await self._reset_inner()
                     continue
                 except (OrderedConsumerClosedError, OrderedConsumerResetError):
                     self._closed = True
@@ -533,5 +623,4 @@ class _OrderedMessageStream(MessageStream):
     async def stop(self) -> None:
         """Stop the ordered message stream."""
         self._closed = True
-        if self._inner is not None:
-            await self._inner.stop()
+        await self._release_inner()

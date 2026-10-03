@@ -1431,3 +1431,216 @@ async def test_ordered_consumer_messages_max_messages_continues(jetstream: JetSt
     assert len(received) == 10
     for i in range(10):
         assert received[i] == f"msg {i}"
+
+
+async def test_ordered_consumer_generation_fence_discards_late_messages(jetstream: JetStream):
+    """Generation fence: late messages from an old consumer generation are discarded.
+
+    Simulates a disconnect/rebuild: after the underlying consumer is recreated, a
+    message that was in flight on the old subscription arrives late carrying the
+    old consumer's name in its reply subject. The generation fence must discard
+    it, and new messages must be delivered in strict stream sequence order with
+    the old subscription released exactly once.
+    """
+    stream = await jetstream.create_stream(name="test_oc_fence", subjects=["OC.FENCE.*"])
+
+    for i in range(3):
+        await jetstream.publish(f"OC.FENCE.{i}", f"msg {i}".encode())
+
+    consumer = await stream.ordered_consumer(
+        filter_subjects=["OC.FENCE.*"],
+        name_prefix="fence",
+    )
+    assert consumer.name == "fence_1"
+
+    messages = await consumer.messages(max_wait=5.0)
+
+    # Consume the first generation's messages.
+    received = []
+    seqs = []
+
+    async for msg in messages:
+        received.append(msg.data.decode())
+        seqs.append(msg.metadata.sequence.stream)
+        if len(received) == 3:
+            break
+
+    assert received == ["msg 0", "msg 1", "msg 2"]
+    assert seqs == [1, 2, 3]
+
+    # Capture the old (generation 1) inner stream and its subscription so we can
+    # verify it is released exactly once after the rebuild.
+    inner_v1 = messages._inner
+    assert inner_v1 is not None
+    sub_v1 = inner_v1._subscription
+
+    release_count = 0
+    orig_unsubscribe = sub_v1.unsubscribe
+
+    async def counting_unsubscribe():
+        nonlocal release_count
+        was_open = not sub_v1.closed
+        result = await orig_unsubscribe()
+        if was_open and sub_v1.closed:
+            release_count += 1
+        return result
+
+    sub_v1.unsubscribe = counting_unsubscribe
+
+    # Simulate a disconnect/rebuild: delete the underlying consumer so the inner
+    # stream ends and the ordered consumer recreates it on the next iteration.
+    # Drive the iterator first to trigger the reset deterministically (the 409
+    # ends the old stream; the new generation waits for messages not yet
+    # published, so this raises TimeoutError).
+    await stream.delete_consumer(consumer.name)
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(messages.__anext__(), timeout=2.0)
+
+    # The consumer has been recreated and the old subscription released once.
+    assert consumer.name == "fence_2"
+    assert release_count == 1, f"old subscription released {release_count} times, expected 1"
+    assert sub_v1.closed
+
+    # Capture the new (generation 2) inner stream and its inbox.
+    inner_v2 = messages._inner
+    assert inner_v2 is not None
+    inbox_v2 = inner_v2._subscription.subject
+
+    # A new message arrives after the rebuild.
+    await jetstream.publish("OC.FENCE.3", b"msg 3")
+
+    msg = await messages.__anext__()
+    assert msg.data == b"msg 3"
+    assert msg.metadata.sequence.stream == 4
+
+    # Simulate a late message from the old generation arriving on the new
+    # subscription. It carries the old consumer's name in its reply subject,
+    # identifying it as a generation-1 message (stream seq 3, consumer seq 3).
+    late_reply = "$JS.ACK.test_oc_fence.fence_1.1.3.3.0.0"
+    await jetstream.client.publish(inbox_v2, b"late", reply=late_reply)
+
+    # Another new message arrives.
+    await jetstream.publish("OC.FENCE.4", b"msg 4")
+
+    # The fence must discard the late message and deliver msg 4 in order.
+    msg = await messages.__anext__()
+    assert msg.data == b"msg 4"
+    assert msg.metadata.sequence.stream == 5
+
+    await messages.stop()
+
+    # Verify the full delivery: no skips, no duplicates, late message dropped.
+    assert received == ["msg 0", "msg 1", "msg 2"]
+    assert seqs == [1, 2, 3]
+
+
+async def test_ordered_consumer_generation_fence_accepts_current_generation(jetstream: JetStream):
+    """A message carrying the current consumer's name is delivered, not fenced."""
+    stream = await jetstream.create_stream(name="test_oc_fence_cur", subjects=["OC.FC.*"])
+
+    await jetstream.publish("OC.FC.1", b"one")
+
+    consumer = await stream.ordered_consumer(
+        filter_subjects=["OC.FC.*"],
+        name_prefix="fcur",
+    )
+    messages = await consumer.messages(max_wait=5.0)
+
+    msg = await messages.__anext__()
+    assert msg.data == b"one"
+    assert msg.metadata.consumer == "fcur_1"
+
+    await messages.stop()
+
+
+async def test_ordered_consumer_stop_releases_subscription_once(jetstream: JetStream):
+    """Calling stop() multiple times releases the inner subscription exactly once."""
+    stream = await jetstream.create_stream(name="test_oc_stop_once", subjects=["OC.SO.*"])
+    await jetstream.publish("OC.SO.1", b"hello")
+
+    consumer = await stream.ordered_consumer(filter_subjects=["OC.SO.*"])
+    messages = await consumer.messages(max_wait=5.0)
+
+    msg = await messages.__anext__()
+    assert msg.data == b"hello"
+
+    inner = messages._inner
+    assert inner is not None
+    sub = inner._subscription
+
+    release_count = 0
+    orig_unsubscribe = sub.unsubscribe
+
+    async def counting_unsubscribe():
+        nonlocal release_count
+        was_open = not sub.closed
+        result = await orig_unsubscribe()
+        if was_open and sub.closed:
+            release_count += 1
+        return result
+
+    sub.unsubscribe = counting_unsubscribe
+
+    # stop() is idempotent: the subscription is released a single time.
+    await messages.stop()
+    await messages.stop()
+    await messages.stop()
+
+    assert release_count == 1
+    assert sub.closed
+
+
+async def test_ordered_consumer_new_generation_does_not_skip(jetstream: JetStream):
+    """After a rebuild the new generation resumes at exactly the next stream sequence."""
+    stream = await jetstream.create_stream(name="test_oc_noskip", subjects=["OC.NS.*"])
+
+    # Publish only the first two messages up front; the rest arrive after the
+    # rebuild so the reset is deterministic.
+    for i in range(2):
+        await jetstream.publish(f"OC.NS.{i}", f"msg {i}".encode())
+
+    consumer = await stream.ordered_consumer(
+        filter_subjects=["OC.NS.*"],
+        name_prefix="noskip",
+    )
+    messages = await consumer.messages(max_wait=5.0)
+
+    # Consume the first two messages.
+    first = []
+    async for msg in messages:
+        first.append(msg.data.decode())
+        if len(first) == 2:
+            break
+
+    assert first == ["msg 0", "msg 1"]
+    assert consumer._cursor.stream_seq == 2
+
+    # Force a rebuild by deleting the underlying consumer.
+    await stream.delete_consumer(consumer.name)
+
+    # Drive the iterator to trigger the reset. The 409 ("consumer deleted") ends
+    # the old inner stream and the ordered consumer recreates it; the new
+    # generation then waits for messages that have not been published yet, so
+    # this raises TimeoutError.
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(messages.__anext__(), timeout=2.0)
+
+    # The consumer has been recreated with an incremented serial.
+    assert consumer.name == "noskip_2"
+
+    # Now publish the remaining messages.
+    for i in range(2, 4):
+        await jetstream.publish(f"OC.NS.{i}", f"msg {i}".encode())
+
+    # The new generation must start at stream seq 3 (no skip) and deliver both.
+    rest = []
+    async for msg in messages:
+        rest.append(msg.data.decode())
+        if len(rest) == 2:
+            break
+
+    assert rest == ["msg 2", "msg 3"]
+    assert consumer._cursor.stream_seq == 4
+
+    await messages.stop()
